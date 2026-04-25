@@ -1,0 +1,19 @@
+# Build output
+build-output/
+
+# Source build artifacts
+src/build/
+src/web/build/
+src/web/backend/dist/*
+!src/web/backend/dist/.gitkeep
+src/web/frontend/node_modules/
+src/cmd/**/workspace/
+
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+
+# OS
+.DS_Store

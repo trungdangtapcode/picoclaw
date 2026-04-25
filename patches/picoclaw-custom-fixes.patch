@@ -1,0 +1,994 @@
+--- a/pkg/agent/loop.go	2026-04-26 01:43:29.071814982 +0700
++++ b/pkg/agent/loop.go	2026-04-18 20:09:59.947933677 +0700
+@@ -575,7 +575,12 @@
+ 		}
+ 
+ 		// Transcribe audio if needed before steering, so the agent sees text.
+-		msg, _ = al.transcribeAudioInMessage(ctx, msg)
++		var transcriptionStatus audioTranscriptionStatus
++		msg, transcriptionStatus = al.transcribeAudioInMessage(ctx, msg)
++		if transcriptionStatus.hadAudio && !transcriptionStatus.usableTranscript {
++			al.sendVoiceRetryPrompt(ctx, msg)
++			continue
++		}
+ 
+ 		logger.InfoCF("agent", "Redirecting inbound message to steering queue",
+ 			map[string]any{
+@@ -1050,41 +1055,66 @@
+ 
+ var audioAnnotationRe = regexp.MustCompile(`\[(voice|audio)(?::[^\]]*)?\]`)
+ 
++type audioTranscriptionStatus struct {
++	hadAudio         bool
++	usableTranscript bool
++}
++
++const voiceRetryPrompt = "Mình nghe chưa rõ tin nhắn thoại này. Bạn nói lại ngắn và rõ hơn giúp mình nhé."
++
+ // transcribeAudioInMessage resolves audio media refs, transcribes them, and
+ // replaces audio annotations in msg.Content with the transcribed text.
+-// Returns the (possibly modified) message and true if audio was transcribed.
+-func (al *AgentLoop) transcribeAudioInMessage(ctx context.Context, msg bus.InboundMessage) (bus.InboundMessage, bool) {
++// Returns the (possibly modified) message plus whether audio was present and
++// whether any usable transcript was produced.
++func (al *AgentLoop) transcribeAudioInMessage(ctx context.Context, msg bus.InboundMessage) (bus.InboundMessage, audioTranscriptionStatus) {
+ 	if al.transcriber == nil || al.mediaStore == nil || len(msg.Media) == 0 {
+-		return msg, false
++		return msg, audioTranscriptionStatus{}
+ 	}
+ 
+-	// Transcribe each audio media ref in order.
++	// Transcribe each audio media ref in order. Keep non-audio refs unchanged.
++	// For audio refs that transcribe successfully, drop the raw media ref so the
++	// downstream LLM sees spoken text instead of an audio file path.
+ 	var transcriptions []string
++	status := audioTranscriptionStatus{}
++	remainingMedia := make([]string, 0, len(msg.Media))
+ 	for _, ref := range msg.Media {
+ 		path, meta, err := al.mediaStore.ResolveWithMeta(ref)
+ 		if err != nil {
+ 			logger.WarnCF("voice", "Failed to resolve media ref", map[string]any{"ref": ref, "error": err})
++			remainingMedia = append(remainingMedia, ref)
+ 			continue
+ 		}
+ 		if !utils.IsAudioFile(meta.Filename, meta.ContentType) {
++			remainingMedia = append(remainingMedia, ref)
+ 			continue
+ 		}
++		status.hadAudio = true
+ 		result, err := al.transcriber.Transcribe(ctx, path)
+ 		if err != nil {
+ 			logger.WarnCF("voice", "Transcription failed", map[string]any{"ref": ref, "error": err})
+-			transcriptions = append(transcriptions, "")
++			remainingMedia = append(remainingMedia, ref)
+ 			continue
+ 		}
+-		transcriptions = append(transcriptions, result.Text)
++		text := strings.TrimSpace(result.Text)
++		if text == "" {
++			logger.WarnCF("voice", "Transcription returned empty text", map[string]any{"ref": ref, "path": path})
++			remainingMedia = append(remainingMedia, ref)
++			continue
++		}
++		status.usableTranscript = true
++		transcriptions = append(transcriptions, text)
+ 	}
+ 
+-	if len(transcriptions) == 0 {
+-		return msg, false
++	if !status.usableTranscript {
++		msg.Media = remainingMedia
++		return msg, status
+ 	}
+ 
+ 	al.sendTranscriptionFeedback(ctx, msg.Channel, msg.ChatID, msg.MessageID, transcriptions)
+ 
+-	// Replace audio annotations sequentially with transcriptions.
++	// Replace audio annotations sequentially with plain transcriptions so the
++	// downstream model treats spoken input like a normal user message instead of
++	// inferring a file-processing workflow from "[voice: ...]" markers.
+ 	idx := 0
+ 	newContent := audioAnnotationRe.ReplaceAllStringFunc(msg.Content, func(match string) string {
+ 		if idx >= len(transcriptions) {
+@@ -1092,16 +1122,40 @@
+ 		}
+ 		text := transcriptions[idx]
+ 		idx++
+-		return "[voice: " + text + "]"
++		return text
+ 	})
+ 
+ 	// Append any remaining transcriptions not matched by an annotation.
+ 	for ; idx < len(transcriptions); idx++ {
+-		newContent += "\n[voice: " + transcriptions[idx] + "]"
++		if strings.TrimSpace(newContent) != "" {
++			newContent += "\n"
++		}
++		newContent += transcriptions[idx]
+ 	}
+ 
+ 	msg.Content = newContent
+-	return msg, true
++	msg.Media = remainingMedia
++	return msg, status
++}
++
++func (al *AgentLoop) sendVoiceRetryPrompt(ctx context.Context, msg bus.InboundMessage) {
++	if al.channelManager == nil || msg.Channel == "" || msg.ChatID == "" {
++		return
++	}
++
++	err := al.channelManager.SendMessage(ctx, bus.OutboundMessage{
++		Channel:          msg.Channel,
++		ChatID:           msg.ChatID,
++		Content:          voiceRetryPrompt,
++		ReplyToMessageID: msg.MessageID,
++	})
++	if err != nil {
++		logger.WarnCF("voice", "Failed to send voice retry prompt", map[string]any{
++			"channel": msg.Channel,
++			"chat_id": msg.ChatID,
++			"error":   err.Error(),
++		})
++	}
+ }
+ 
+ // sendTranscriptionFeedback sends feedback to the user with the result of
+@@ -1271,12 +1325,16 @@
+ 		},
+ 	)
+ 
+-	var hadAudio bool
+-	msg, hadAudio = al.transcribeAudioInMessage(ctx, msg)
++	var transcriptionStatus audioTranscriptionStatus
++	msg, transcriptionStatus = al.transcribeAudioInMessage(ctx, msg)
++	if transcriptionStatus.hadAudio && !transcriptionStatus.usableTranscript {
++		al.sendVoiceRetryPrompt(ctx, msg)
++		return "", nil
++	}
+ 
+ 	// For audio messages the placeholder was deferred by the channel.
+ 	// Now that transcription (and optional feedback) is done, send it.
+-	if hadAudio && al.channelManager != nil {
++	if transcriptionStatus.usableTranscript && al.channelManager != nil {
+ 		al.channelManager.SendPlaceholder(ctx, msg.Channel, msg.ChatID)
+ 	}
+ 
+--- a/pkg/agent/loop_test.go	2026-04-26 01:43:29.075815024 +0700
++++ b/pkg/agent/loop_test.go	2026-04-18 20:10:23.272213887 +0700
+@@ -21,6 +21,7 @@
+ 	"github.com/sipeed/picoclaw/pkg/providers"
+ 	"github.com/sipeed/picoclaw/pkg/routing"
+ 	"github.com/sipeed/picoclaw/pkg/tools"
++	"github.com/sipeed/picoclaw/pkg/voice"
+ )
+ 
+ type fakeChannel struct{ id string }
+@@ -44,6 +45,16 @@
+ 	return nil
+ }
+ 
++type recordingSendChannel struct {
++	fakeChannel
++	sent []bus.OutboundMessage
++}
++
++func (r *recordingSendChannel) Send(ctx context.Context, msg bus.OutboundMessage) error {
++	r.sent = append(r.sent, msg)
++	return nil
++}
++
+ func newStartedTestChannelManager(
+ 	t *testing.T,
+ 	msgBus *bus.MessageBus,
+@@ -73,6 +84,23 @@
+ 	lastMessages []providers.Message
+ }
+ 
++type fakeTranscriber struct {
++	text string
++	err  error
++}
++
++func (f *fakeTranscriber) Name() string { return "fake" }
++
++func (f *fakeTranscriber) Transcribe(
++	ctx context.Context,
++	audioFilePath string,
++) (*voice.TranscriptionResponse, error) {
++	if f.err != nil {
++		return nil, f.err
++	}
++	return &voice.TranscriptionResponse{Text: f.text}, nil
++}
++
+ func (r *recordingProvider) Chat(
+ 	ctx context.Context,
+ 	messages []providers.Message,
+@@ -2594,6 +2622,137 @@
+ 	}
+ }
+ 
++func TestTranscribeAudioInMessage_RemovesSuccessfulAudioMedia(t *testing.T) {
++	al, _, _, _, cleanup := newTestAgentLoop(t)
++	defer cleanup()
++
++	store := media.NewFileMediaStore()
++	al.SetMediaStore(store)
++	al.SetTranscriber(&fakeTranscriber{text: "turn on the pump"})
++
++	dir := t.TempDir()
++	audioPath := filepath.Join(dir, "note.ogg")
++	if err := os.WriteFile(audioPath, []byte("fake-audio"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	audioRef, err := store.Store(audioPath, media.MediaMeta{Filename: "voice.ogg"}, "scope-a")
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	txtPath := filepath.Join(dir, "note.txt")
++	if err := os.WriteFile(txtPath, []byte("hello"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	fileRef, err := store.Store(txtPath, media.MediaMeta{Filename: "note.txt"}, "scope-a")
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	msg := bus.InboundMessage{
++		Content: "[voice]",
++		Media:   []string{audioRef, fileRef},
++	}
++
++	got, status := al.transcribeAudioInMessage(context.Background(), msg)
++	if !status.hadAudio {
++		t.Fatal("expected hadAudio = true")
++	}
++	if !status.usableTranscript {
++		t.Fatal("expected usableTranscript = true")
++	}
++	if got.Content != "turn on the pump" {
++		t.Fatalf("content = %q", got.Content)
++	}
++	if len(got.Media) != 1 || got.Media[0] != fileRef {
++		t.Fatalf("media = %#v, want only non-audio ref", got.Media)
++	}
++}
++
++func TestTranscribeAudioInMessage_EmptyTranscriptPreservesOriginalContent(t *testing.T) {
++	al, _, _, _, cleanup := newTestAgentLoop(t)
++	defer cleanup()
++
++	store := media.NewFileMediaStore()
++	al.SetMediaStore(store)
++	al.SetTranscriber(&fakeTranscriber{text: ""})
++
++	dir := t.TempDir()
++	audioPath := filepath.Join(dir, "note.ogg")
++	if err := os.WriteFile(audioPath, []byte("fake-audio"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	audioRef, err := store.Store(audioPath, media.MediaMeta{Filename: "voice.ogg"}, "scope-a")
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	msg := bus.InboundMessage{
++		Content: "[voice]",
++		Media:   []string{audioRef},
++	}
++
++	got, status := al.transcribeAudioInMessage(context.Background(), msg)
++	if !status.hadAudio {
++		t.Fatal("expected hadAudio = true")
++	}
++	if status.usableTranscript {
++		t.Fatal("expected usableTranscript = false")
++	}
++	if got.Content != "[voice]" {
++		t.Fatalf("content = %q, want original annotation", got.Content)
++	}
++	if len(got.Media) != 1 || got.Media[0] != audioRef {
++		t.Fatalf("media = %#v, want original audio ref preserved", got.Media)
++	}
++}
++
++func TestProcessMessage_EmptyTranscriptRepliesWithRetryPrompt(t *testing.T) {
++	al, _, msgBus, _, cleanup := newTestAgentLoop(t)
++	defer cleanup()
++
++	store := media.NewFileMediaStore()
++	al.SetMediaStore(store)
++	al.SetTranscriber(&fakeTranscriber{text: ""})
++
++	ch := &recordingSendChannel{}
++	al.SetChannelManager(newStartedTestChannelManager(t, msgBus, store, "telegram", ch))
++
++	dir := t.TempDir()
++	audioPath := filepath.Join(dir, "note.ogg")
++	if err := os.WriteFile(audioPath, []byte("fake-audio"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	audioRef, err := store.Store(audioPath, media.MediaMeta{Filename: "voice.ogg"}, "scope-a")
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	resp, err := al.processMessage(context.Background(), bus.InboundMessage{
++		Channel:   "telegram",
++		SenderID:  "telegram:123",
++		ChatID:    "chat-1",
++		MessageID: "msg-1",
++		Content:   "[voice]",
++		Media:     []string{audioRef},
++	})
++	if err != nil {
++		t.Fatalf("processMessage() error = %v", err)
++	}
++	if resp != "" {
++		t.Fatalf("response = %q, want empty because retry prompt is sent directly", resp)
++	}
++	if len(ch.sent) != 1 {
++		t.Fatalf("sent messages = %d, want 1", len(ch.sent))
++	}
++	if ch.sent[0].Content != voiceRetryPrompt {
++		t.Fatalf("sent content = %q", ch.sent[0].Content)
++	}
++	if ch.sent[0].ReplyToMessageID != "msg-1" {
++		t.Fatalf("reply_to = %q, want msg-1", ch.sent[0].ReplyToMessageID)
++	}
++}
++
+ func TestResolveMediaRefs_SkipsOversizedFile(t *testing.T) {
+ 	store := media.NewFileMediaStore()
+ 	dir := t.TempDir()
+--- a/pkg/channels/telegram/telegram.go	2026-04-26 01:43:29.079815066 +0700
++++ b/pkg/channels/telegram/telegram.go	2026-04-18 14:14:58.959076575 +0700
+@@ -737,6 +737,7 @@
+ 	filename := file.FilePath + ext
+ 	return utils.DownloadFile(url, filename, utils.DownloadOptions{
+ 		LoggerPrefix: "telegram",
++		ProxyURL:     strings.TrimSpace(c.config.Channels.Telegram.Proxy),
+ 	})
+ }
+ 
+--- a/pkg/config/config.go	2026-04-26 01:43:29.083815109 +0700
++++ b/pkg/config/config.go	2026-04-18 14:23:04.336753396 +0700
+@@ -640,6 +640,7 @@
+ 
+ type VoiceConfig struct {
+ 	ModelName         string `json:"model_name,omitempty"         env:"PICOCLAW_VOICE_MODEL_NAME"`
++	Language          string `json:"language,omitempty"           env:"PICOCLAW_VOICE_LANGUAGE"`
+ 	EchoTranscription bool   `json:"echo_transcription"           env:"PICOCLAW_VOICE_ECHO_TRANSCRIPTION"`
+ 	ElevenLabsAPIKey  string `json:"elevenlabs_api_key,omitempty" env:"PICOCLAW_VOICE_ELEVENLABS_API_KEY"`
+ }
+--- a/pkg/providers/factory_provider.go	2026-04-26 01:43:29.087815151 +0700
++++ b/pkg/providers/factory_provider.go	2026-03-29 01:14:08.681102793 +0700
+@@ -41,6 +41,30 @@
+ 	return NewCodexProviderWithTokenSource(cred.AccessToken, cred.AccountID, createCodexTokenSource()), nil
+ }
+ 
++// createOpenAITokenProvider creates a standard OpenAI-compatible HTTP provider
++// using a token credential from the auth store as the API key.
++func createOpenAITokenProvider(cfg *config.ModelConfig) (LLMProvider, error) {
++	cred, err := getCredential("openai")
++	if err != nil {
++		return nil, fmt.Errorf("loading auth credentials: %w", err)
++	}
++	if cred == nil {
++		return nil, fmt.Errorf("no credentials for openai. Run: picoclaw auth login --provider openai")
++	}
++	apiBase := cfg.APIBase
++	if apiBase == "" {
++		apiBase = getDefaultAPIBase("openai")
++	}
++	return NewHTTPProviderWithMaxTokensFieldAndRequestTimeout(
++		cred.AccessToken,
++		apiBase,
++		cfg.Proxy,
++		cfg.MaxTokensField,
++		cfg.RequestTimeout,
++		cfg.ExtraBody,
++	), nil
++}
++
+ // ExtractProtocol extracts the protocol prefix and model identifier from a model string.
+ // If no prefix is specified, it defaults to "openai".
+ // Examples:
+@@ -75,12 +99,20 @@
+ 
+ 	switch protocol {
+ 	case "openai":
+-		// OpenAI with OAuth/token auth (Codex-style)
+-		if cfg.AuthMethod == "oauth" || cfg.AuthMethod == "token" {
++		// OpenAI OAuth uses the ChatGPT/Codex backend.
++		if cfg.AuthMethod == "oauth" {
+ 			provider, err := createCodexAuthProvider()
+ 			if err != nil {
+ 				return nil, "", err
+ 			}
++			return provider, modelID, nil
++		}
++		// OpenAI token auth should use the standard OpenAI HTTP API.
++		if cfg.AuthMethod == "token" && cfg.APIKey() == "" {
++			provider, err := createOpenAITokenProvider(cfg)
++			if err != nil {
++				return nil, "", err
++			}
+ 			return provider, modelID, nil
+ 		}
+ 		// OpenAI with API key
+--- a/pkg/providers/factory_test.go	2026-04-26 01:43:29.087815151 +0700
++++ b/pkg/providers/factory_test.go	2026-03-29 01:14:24.257307846 +0700
+@@ -104,8 +104,72 @@
+ 	// TODO: Test custom APIBase when createClaudeAuthProvider supports it
+ }
+ 
++func TestCreateProviderReturnsHTTPProviderForOpenAITokenAuth(t *testing.T) {
++	originalGetCredential := getCredential
++	t.Cleanup(func() { getCredential = originalGetCredential })
++
++	getCredential = func(provider string) (*auth.AuthCredential, error) {
++		if provider != "openai" {
++			t.Fatalf("provider = %q, want openai", provider)
++		}
++		return &auth.AuthCredential{
++			AccessToken: "sk-test",
++			AuthMethod:  "token",
++		}, nil
++	}
++
++	cfg := config.DefaultConfig()
++	cfg.Agents.Defaults.ModelName = "test-openai-token"
++	cfg.ModelList = []*config.ModelConfig{
++		{
++			ModelName:  "test-openai-token",
++			Model:      "openai/gpt-5-nano",
++			AuthMethod: "token",
++			APIBase:    "https://api.openai.com/v1",
++		},
++	}
++
++	provider, _, err := CreateProvider(cfg)
++	if err != nil {
++		t.Fatalf("CreateProvider() error = %v", err)
++	}
++
++	if _, ok := provider.(*HTTPProvider); !ok {
++		t.Fatalf("provider type = %T, want *HTTPProvider", provider)
++	}
++}
++
+ func TestCreateProviderReturnsCodexProviderForOpenAIOAuth(t *testing.T) {
+-	// TODO: This test requires openai protocol to support auth_method: "oauth"
+-	// which is not yet implemented in the new factory_provider.go
+-	t.Skip("OpenAI OAuth via model_list not yet implemented")
++	originalGetCredential := getCredential
++	t.Cleanup(func() { getCredential = originalGetCredential })
++
++	getCredential = func(provider string) (*auth.AuthCredential, error) {
++		if provider != "openai" {
++			t.Fatalf("provider = %q, want openai", provider)
++		}
++		return &auth.AuthCredential{
++			AccessToken: "oauth-token",
++			AccountID:   "acct-test",
++			AuthMethod:  "oauth",
++		}, nil
++	}
++
++	cfg := config.DefaultConfig()
++	cfg.Agents.Defaults.ModelName = "test-openai-oauth"
++	cfg.ModelList = []*config.ModelConfig{
++		{
++			ModelName:  "test-openai-oauth",
++			Model:      "openai/gpt-5-nano",
++			AuthMethod: "oauth",
++		},
++	}
++
++	provider, _, err := CreateProvider(cfg)
++	if err != nil {
++		t.Fatalf("CreateProvider() error = %v", err)
++	}
++
++	if _, ok := provider.(*CodexProvider); !ok {
++		t.Fatalf("provider type = %T, want *CodexProvider", provider)
++	}
+ }
+--- a/pkg/providers/openai_compat/provider.go	2026-04-26 01:43:29.091815193 +0700
++++ b/pkg/providers/openai_compat/provider.go	2026-03-29 01:19:07.420528352 +0700
+@@ -106,11 +106,11 @@
+ 		"messages": common.SerializeMessages(messages),
+ 	}
+ 
+-	// When fallback uses a different provider (e.g. DeepSeek), that provider must not inject web_search_preview.
+-	nativeSearch, _ := options["native_search"].(bool)
+-	nativeSearch = nativeSearch && isNativeSearchHost(p.apiBase)
+-	if len(tools) > 0 || nativeSearch {
+-		requestBody["tools"] = buildToolsList(tools, nativeSearch)
++	// The chat/completions API path used by this provider only supports "function"
++	// and "custom" tools. OpenAI-native web search tool types are rejected here,
++	// so we always rely on the client-side web_search tool instead.
++	if len(tools) > 0 {
++		requestBody["tools"] = buildToolsList(tools, false)
+ 		requestBody["tool_choice"] = "auto"
+ 	}
+ 
+@@ -132,6 +132,10 @@
+ 		lowerModel := strings.ToLower(model)
+ 		if strings.Contains(lowerModel, "kimi") && strings.Contains(lowerModel, "k2") {
+ 			requestBody["temperature"] = 1.0
++		} else if strings.Contains(lowerModel, "gpt-5") {
++			// GPT-5 chat/completions models only support the default temperature.
++			// Omitting the field avoids 400 errors for inherited defaults like 0.7.
++			// Leave the request body unchanged.
+ 		} else {
+ 			requestBody["temperature"] = temperature
+ 		}
+@@ -415,22 +419,17 @@
+ 		result = append(result, t)
+ 	}
+ 	if nativeSearch {
+-		result = append(result, map[string]any{"type": "web_search_preview"})
++		result = append(result, map[string]any{"type": "web_search"})
+ 	}
+ 	return result
+ }
+ 
+ func (p *Provider) SupportsNativeSearch() bool {
+-	return isNativeSearchHost(p.apiBase)
++	return false
+ }
+ 
+ func isNativeSearchHost(apiBase string) bool {
+-	u, err := url.Parse(apiBase)
+-	if err != nil {
+-		return false
+-	}
+-	host := u.Hostname()
+-	return host == "api.openai.com" || strings.HasSuffix(host, ".openai.azure.com")
++	return false
+ }
+ 
+ // supportsPromptCacheKey reports whether the given API base is known to
+--- a/pkg/providers/openai_compat/provider_test.go	2026-04-26 01:43:29.095815235 +0700
++++ b/pkg/providers/openai_compat/provider_test.go	2026-03-29 01:18:04.687885851 +0700
+@@ -929,40 +929,17 @@
+ 	}
+ }
+ 
+-func TestBuildToolsList_NativeSearchAddsWebSearchPreview(t *testing.T) {
++func TestBuildToolsList_NativeSearchDisabledLeavesFunctionToolsOnly(t *testing.T) {
+ 	tools := []ToolDefinition{
+ 		{Type: "function", Function: ToolFunctionDefinition{Name: "read_file", Description: "read"}},
+ 	}
+-	result := buildToolsList(tools, true)
+-	if len(result) != 2 {
+-		t.Fatalf("len(result) = %d, want 2", len(result))
+-	}
+-	wsEntry, ok := result[1].(map[string]any)
+-	if !ok {
+-		t.Fatalf("web search entry is %T, want map[string]any", result[1])
+-	}
+-	if wsEntry["type"] != "web_search_preview" {
+-		t.Fatalf("type = %v, want web_search_preview", wsEntry["type"])
+-	}
+-}
+-
+-func TestBuildToolsList_NativeSearchFiltersClientWebSearch(t *testing.T) {
+-	tools := []ToolDefinition{
+-		{Type: "function", Function: ToolFunctionDefinition{Name: "web_search", Description: "search"}},
+-		{Type: "function", Function: ToolFunctionDefinition{Name: "read_file", Description: "read"}},
+-	}
+-	result := buildToolsList(tools, true)
+-	for _, entry := range result {
+-		if td, ok := entry.(ToolDefinition); ok && strings.EqualFold(td.Function.Name, "web_search") {
+-			t.Fatal("client-side web_search should be filtered out when native search is enabled")
+-		}
+-	}
+-	if len(result) != 2 { // read_file + web_search_preview
+-		t.Fatalf("len(result) = %d, want 2 (read_file + web_search_preview)", len(result))
++	result := buildToolsList(tools, false)
++	if len(result) != 1 {
++		t.Fatalf("len(result) = %d, want 1", len(result))
+ 	}
+ }
+ 
+-func TestBuildToolsList_NoNativeSearchPassesThrough(t *testing.T) {
++func TestBuildToolsList_NoNativeSearchPassesThroughClientWebSearch(t *testing.T) {
+ 	tools := []ToolDefinition{
+ 		{Type: "function", Function: ToolFunctionDefinition{Name: "web_search", Description: "search"}},
+ 		{Type: "function", Function: ToolFunctionDefinition{Name: "read_file", Description: "read"}},
+@@ -978,8 +955,8 @@
+ 		apiBase string
+ 		want    bool
+ 	}{
+-		{"https://api.openai.com/v1", true},
+-		{"https://myresource.openai.azure.com/openai/deployments/gpt-4", true},
++		{"https://api.openai.com/v1", false},
++		{"https://myresource.openai.azure.com/openai/deployments/gpt-4", false},
+ 		{"https://api.mistral.ai/v1", false},
+ 		{"https://api.deepseek.com/v1", false},
+ 		{"https://api.groq.com/openai/v1", false},
+@@ -993,10 +970,10 @@
+ 	}
+ }
+ 
+-func TestSupportsNativeSearch_OpenAI(t *testing.T) {
++func TestSupportsNativeSearch_OpenAICompatDisabled(t *testing.T) {
+ 	p := NewProvider("key", "https://api.openai.com/v1", "")
+-	if !p.SupportsNativeSearch() {
+-		t.Fatal("OpenAI provider should support native search")
++	if p.SupportsNativeSearch() {
++		t.Fatal("OpenAI-compatible chat/completions provider should not advertise native search")
+ 	}
+ }
+ 
+@@ -1007,7 +984,7 @@
+ 	}
+ }
+ 
+-func TestProviderChat_NativeSearchToolInjected(t *testing.T) {
++func TestProviderChat_NativeSearchOptionDoesNotInjectBuiltInTool(t *testing.T) {
+ 	var requestBody map[string]any
+ 
+ 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+@@ -1054,16 +1031,8 @@
+ 	if !ok {
+ 		t.Fatalf("tools is %T, want []any", requestBody["tools"])
+ 	}
+-	if len(toolsRaw) != 2 {
+-		t.Fatalf("len(tools) = %d, want 2 (read_file + web_search_preview)", len(toolsRaw))
+-	}
+-
+-	lastTool, ok := toolsRaw[1].(map[string]any)
+-	if !ok {
+-		t.Fatalf("last tool is %T, want map[string]any", toolsRaw[1])
+-	}
+-	if lastTool["type"] != "web_search_preview" {
+-		t.Fatalf("last tool type = %v, want web_search_preview", lastTool["type"])
++	if len(toolsRaw) != 1 {
++		t.Fatalf("len(tools) = %d, want 1 (read_file only)", len(toolsRaw))
+ 	}
+ }
+ 
+@@ -1112,10 +1081,9 @@
+ 	}
+ }
+ 
+-// TestProviderChat_NativeSearchIgnoredOnNonOpenAI verifies that when native_search
+-// is true in options but the provider's apiBase is not OpenAI (e.g. fallback to DeepSeek),
+-// we do not inject web_search_preview to avoid API errors.
+-func TestProviderChat_NativeSearchIgnoredOnNonOpenAI(t *testing.T) {
++// TestProviderChat_NativeSearchIgnored verifies that the OpenAI-compatible
++// chat/completions provider does not inject any built-in web-search tool.
++func TestProviderChat_NativeSearchIgnored(t *testing.T) {
+ 	var requestBody map[string]any
+ 
+ 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+@@ -1136,7 +1104,6 @@
+ 	}))
+ 	defer server.Close()
+ 
+-	// Use server.URL so host is not api.openai.com — simulates DeepSeek/other provider
+ 	p := NewProvider("key", server.URL, "")
+ 	_, err := p.Chat(
+ 		t.Context(),
+@@ -1149,9 +1116,9 @@
+ 		t.Fatalf("Chat() error = %v", err)
+ 	}
+ 
+-	// Should not have tools at all (no tools passed, and we must not add web_search_preview)
++	// Should not have tools at all (no tools passed, and we must not add native web_search)
+ 	if toolsRaw, ok := requestBody["tools"]; ok {
+-		t.Fatalf("tools should be omitted for non-OpenAI when only native_search was requested, got %v", toolsRaw)
++		t.Fatalf("tools should be omitted when only native_search was requested, got %v", toolsRaw)
+ 	}
+ }
+ 
+--- a/pkg/voice/audio_model_transcriber.go	2026-04-26 01:43:29.099815278 +0700
++++ b/pkg/voice/audio_model_transcriber.go	2026-04-18 19:55:20.769098057 +0700
+@@ -1,15 +1,22 @@
+ package voice
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"encoding/base64"
++	"encoding/json"
+ 	"fmt"
++	"io"
++	"mime/multipart"
++	"net/http"
+ 	"os"
++	"path/filepath"
+ 	"strings"
+ 
+ 	"github.com/sipeed/picoclaw/pkg/config"
+ 	"github.com/sipeed/picoclaw/pkg/logger"
+ 	"github.com/sipeed/picoclaw/pkg/providers"
++	"github.com/sipeed/picoclaw/pkg/providers/common"
+ 	"github.com/sipeed/picoclaw/pkg/utils"
+ )
+ 
+@@ -17,13 +24,17 @@
+ 	provider providers.LLMProvider
+ 	modelID  string
+ 	prompt   string
++	language string
++	apiKey   string
++	apiBase  string
++	client   *http.Client
+ }
+ 
+ const (
+ 	defaultTranscriptionPrompt = "Transcribe this audio."
+ )
+ 
+-func NewAudioModelTranscriber(modelCfg *config.ModelConfig) *AudioModelTranscriber {
++func NewAudioModelTranscriber(modelCfg *config.ModelConfig, voiceCfg config.VoiceConfig) *AudioModelTranscriber {
+ 	if modelCfg == nil {
+ 		return nil
+ 	}
+@@ -43,11 +54,35 @@
+ 	return &AudioModelTranscriber{
+ 		provider: provider,
+ 		modelID:  modelID,
+-		prompt:   defaultTranscriptionPrompt,
++		prompt:   defaultPromptForLanguage(voiceCfg.Language),
++		language: strings.TrimSpace(voiceCfg.Language),
++		apiKey:   modelCfg.APIKey(),
++		apiBase:  strings.TrimRight(modelCfg.APIBase, "/"),
++		client:   common.NewHTTPClient(modelCfg.Proxy),
++	}
++}
++
++func defaultPromptForLanguage(language string) string {
++	switch strings.ToLower(strings.TrimSpace(language)) {
++	case "vi":
++		return "Hay phien am chinh xac bang tieng Viet, giu nguyen noi dung goc, khong dich sang tieng Anh."
++	default:
++		return defaultTranscriptionPrompt
+ 	}
+ }
+ 
+ func (t *AudioModelTranscriber) Transcribe(ctx context.Context, audioFilePath string) (*TranscriptionResponse, error) {
++	if usesAudioTranscriptionsEndpoint(t.modelID) {
++		return t.transcribeViaAudioAPI(ctx, audioFilePath)
++	}
++
++	return t.transcribeViaChat(ctx, audioFilePath)
++}
++
++func (t *AudioModelTranscriber) transcribeViaChat(
++	ctx context.Context,
++	audioFilePath string,
++) (*TranscriptionResponse, error) {
+ 	logger.InfoCF("voice", "Starting audio model transcription", map[string]any{
+ 		"audio_file": audioFilePath,
+ 		"model":      t.modelID,
+@@ -90,6 +125,104 @@
+ 	return &TranscriptionResponse{Text: text}, nil
+ }
+ 
++func (t *AudioModelTranscriber) transcribeViaAudioAPI(
++	ctx context.Context,
++	audioFilePath string,
++) (*TranscriptionResponse, error) {
++	logger.InfoCF("voice", "Starting transcription via audio API", map[string]any{
++		"audio_file": audioFilePath,
++		"model":      t.modelID,
++	})
++
++	audioFile, err := os.Open(audioFilePath)
++	if err != nil {
++		logger.ErrorCF("voice", "Failed to open audio file", map[string]any{"path": audioFilePath, "error": err})
++		return nil, fmt.Errorf("failed to open audio file: %w", err)
++	}
++	defer audioFile.Close()
++
++	var requestBody bytes.Buffer
++	writer := multipart.NewWriter(&requestBody)
++
++	part, err := writer.CreateFormFile("file", filepath.Base(audioFilePath))
++	if err != nil {
++		logger.ErrorCF("voice", "Failed to create form file", map[string]any{"error": err})
++		return nil, fmt.Errorf("failed to create form file: %w", err)
++	}
++	if _, err := io.Copy(part, audioFile); err != nil {
++		logger.ErrorCF("voice", "Failed to copy file content", map[string]any{"error": err})
++		return nil, fmt.Errorf("failed to copy file content: %w", err)
++	}
++
++	if err := writer.WriteField("model", t.modelID); err != nil {
++		logger.ErrorCF("voice", "Failed to write model field", map[string]any{"error": err})
++		return nil, fmt.Errorf("failed to write model field: %w", err)
++	}
++	if strings.TrimSpace(t.language) != "" {
++		if err := writer.WriteField("language", strings.TrimSpace(t.language)); err != nil {
++			logger.ErrorCF("voice", "Failed to write language field", map[string]any{"error": err})
++			return nil, fmt.Errorf("failed to write language field: %w", err)
++		}
++	}
++	if err := writer.WriteField("response_format", "json"); err != nil {
++		logger.ErrorCF("voice", "Failed to write response_format field", map[string]any{"error": err})
++		return nil, fmt.Errorf("failed to write response_format field: %w", err)
++	}
++	if err := writer.Close(); err != nil {
++		logger.ErrorCF("voice", "Failed to close multipart writer", map[string]any{"error": err})
++		return nil, fmt.Errorf("failed to close multipart writer: %w", err)
++	}
++
++	req, err := http.NewRequestWithContext(ctx, "POST", t.apiBase+"/audio/transcriptions", &requestBody)
++	if err != nil {
++		logger.ErrorCF("voice", "Failed to create request", map[string]any{"error": err})
++		return nil, fmt.Errorf("failed to create request: %w", err)
++	}
++	req.Header.Set("Content-Type", writer.FormDataContentType())
++	if t.apiKey != "" {
++		req.Header.Set("Authorization", "Bearer "+t.apiKey)
++	}
++
++	resp, err := t.client.Do(req)
++	if err != nil {
++		logger.ErrorCF("voice", "Failed to send audio API request", map[string]any{"error": err})
++		return nil, fmt.Errorf("failed to send request: %w", err)
++	}
++	defer resp.Body.Close()
++
++	body, err := io.ReadAll(resp.Body)
++	if err != nil {
++		logger.ErrorCF("voice", "Failed to read audio API response", map[string]any{"error": err})
++		return nil, fmt.Errorf("failed to read response: %w", err)
++	}
++
++	if resp.StatusCode != http.StatusOK {
++		logger.ErrorCF("voice", "Audio API error", map[string]any{
++			"status_code": resp.StatusCode,
++			"response":    string(body),
++		})
++		return nil, fmt.Errorf("audio API error (status %d): %s", resp.StatusCode, string(body))
++	}
++
++	var result TranscriptionResponse
++	if err := json.Unmarshal(body, &result); err != nil {
++		logger.ErrorCF("voice", "Failed to unmarshal audio API response", map[string]any{"error": err})
++		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
++	}
++
++	result.Text = strings.TrimSpace(result.Text)
++	logger.InfoCF("voice", "Audio API transcription completed successfully", map[string]any{
++		"text_length":           len(result.Text),
++		"transcription_preview": utils.Truncate(result.Text, 50),
++	})
++
++	return &result, nil
++}
++
++func usesAudioTranscriptionsEndpoint(modelID string) bool {
++	return strings.Contains(strings.ToLower(strings.TrimSpace(modelID)), "-transcribe")
++}
++
+ func (t *AudioModelTranscriber) Name() string {
+ 	return "audio-model"
+ }
+--- a/pkg/voice/audio_model_transcriber_test.go	2026-04-26 01:43:29.099815278 +0700
++++ b/pkg/voice/audio_model_transcriber_test.go	2026-04-18 19:55:03.036869658 +0700
+@@ -4,6 +4,9 @@
+ 	"context"
+ 	"encoding/base64"
+ 	"errors"
++	"io"
++	"net/http"
++	"net/http/httptest"
+ 	"os"
+ 	"path/filepath"
+ 	"testing"
+@@ -67,7 +70,7 @@
+ 
+ 	for _, tt := range tests {
+ 		t.Run(tt.name, func(t *testing.T) {
+-			if tr := NewAudioModelTranscriber(tt.cfg); tr != nil {
++			if tr := NewAudioModelTranscriber(tt.cfg, config.VoiceConfig{}); tr != nil {
+ 				t.Fatalf("NewAudioModelTranscriber() = %#v, want nil", tr)
+ 			}
+ 		})
+@@ -167,6 +170,73 @@
+ 		}
+ 	})
+ 
++	t.Run("transcribe model uses audio api", func(t *testing.T) {
++		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			if r.Method != http.MethodPost {
++				t.Fatalf("method = %s, want POST", r.Method)
++			}
++			if r.URL.Path != "/audio/transcriptions" {
++				t.Fatalf("path = %s, want /audio/transcriptions", r.URL.Path)
++			}
++			if got := r.Header.Get("Authorization"); got != "Bearer sk-test" {
++				t.Fatalf("Authorization = %q", got)
++			}
++
++			if err := r.ParseMultipartForm(1 << 20); err != nil {
++				t.Fatalf("ParseMultipartForm error: %v", err)
++			}
++			if got := r.FormValue("model"); got != "gpt-4o-mini-transcribe" {
++				t.Fatalf("model = %q, want gpt-4o-mini-transcribe", got)
++			}
++			if got := r.FormValue("prompt"); got != "" {
++				t.Fatalf("prompt = %q, want empty", got)
++			}
++			if got := r.FormValue("language"); got != "vi" {
++				t.Fatalf("language = %q, want vi", got)
++			}
++			if got := r.FormValue("response_format"); got != "json" {
++				t.Fatalf("response_format = %q, want json", got)
++			}
++
++			f, hdr, err := r.FormFile("file")
++			if err != nil {
++				t.Fatalf("FormFile error: %v", err)
++			}
++			defer f.Close()
++			if hdr == nil || hdr.Filename != "clip.ogg" {
++				t.Fatalf("filename = %v, want clip.ogg", hdr)
++			}
++			body, err := io.ReadAll(f)
++			if err != nil {
++				t.Fatalf("ReadAll error: %v", err)
++			}
++			if string(body) != string(audioData) {
++				t.Fatalf("uploaded body = %q, want %q", string(body), string(audioData))
++			}
++
++			w.Header().Set("Content-Type", "application/json")
++			_, _ = w.Write([]byte(`{"text":"hello from audio api"}`))
++		}))
++		defer srv.Close()
++
++		tr := &AudioModelTranscriber{
++			modelID:  "gpt-4o-mini-transcribe",
++			prompt:   defaultPromptForLanguage("vi"),
++			language: "vi",
++			apiKey:   "sk-test",
++			apiBase:  srv.URL,
++			client:   srv.Client(),
++		}
++
++		resp, err := tr.Transcribe(context.Background(), audioPath)
++		if err != nil {
++			t.Fatalf("Transcribe() error: %v", err)
++		}
++		if resp.Text != "hello from audio api" {
++			t.Fatalf("Text = %q, want %q", resp.Text, "hello from audio api")
++		}
++	})
++
+ 	t.Run("missing file", func(t *testing.T) {
+ 		tr := &AudioModelTranscriber{
+ 			provider: &fakeLLMProvider{},
+--- a/pkg/voice/transcriber.go	2026-04-26 01:43:29.103815320 +0700
++++ b/pkg/voice/transcriber.go	2026-04-18 14:23:10.240559582 +0700
+@@ -50,7 +50,7 @@
+ 			return nil
+ 		}
+ 		if supportsAudioTranscription(modelCfg.Model) {
+-			return NewAudioModelTranscriber(modelCfg)
++			return NewAudioModelTranscriber(modelCfg, cfg.Voice)
+ 		}
+ 	}
+ 
+--- a/.gitignore	2026-04-26 01:43:29.107815362 +0700
++++ b/.gitignore	2026-04-11 14:18:54.149582368 +0700
+@@ -36,6 +36,9 @@
+ # OS
+ .DS_Store
+ 
++# JavaScript
++node_modules/
++
+ # Ralph workspace
+ ralph/
+ .ralph/

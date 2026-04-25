@@ -1,0 +1,56 @@
+# Build artifacts
+build/
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/picoclaw
+/picoclaw-test
+
+# Generated workspace
+cmd/**/workspace
+
+# Runtime
+.picoclaw/
+config.json
+sessions/
+.security.yml
+onboard
+.env
+
+# Coverage
+coverage.txt
+coverage.html
+
+# OS
+.DS_Store
+
+# JavaScript / Frontend build
+node_modules/
+web/backend/dist/*
+!web/backend/dist/.gitkeep
+web/build/
+*.vite/
+
+# Windows
+*.syso
+
+# Editors
+.vscode/
+.idea/
+.claude/
+
+# Docker data
+docker/data
+
+# GoReleaser
+dist/
+
+# Tests
+cmd/telegram/
+
+# Keep placeholder
+!web/backend/dist/.gitkeep

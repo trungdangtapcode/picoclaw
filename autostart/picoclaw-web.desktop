@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=PicoClaw Web
+Comment=Start PicoClaw Web on login
+Exec=/home/mq/pico_iot/picoclaw-launcher -no-browser /home/mq/.picoclaw/config.json
+Terminal=false
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
